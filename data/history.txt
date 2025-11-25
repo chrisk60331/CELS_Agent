@@ -1,0 +1,33 @@
+## Summary of data/history.json
+
+This file contains a comprehensive historical database with **795 recorded events** spanning from **1001 to 1100 CE** (early 11th century). Here are the key characteristics:
+
+### **Structure:**
+- Each event includes:
+  - **Date** (ranging from 1001/02/06 to 1100/12/25)
+  - **Description** of the historical event
+  - **Language** (English)
+  - **Category**: Events are organized by geography ("By place": Europe, Asia, Africa, Americas, etc.) and occasionally by topic (Religion, Arts, Technology, etc.)
+  - **Granularity**: All set to "year" level
+
+### **Geographic Coverage:**
+- **Europe** - Dominant coverage including England, France, Germany, Poland, Scandinavia, Italy, and more
+- **Asia** - China (Song Dynasty), Persia, Turkey (Seljuk), India, Korea, Vietnam, Japan
+- **Africa** - North Africa, Egypt (Fatimids), Morocco (Almoravids), Ethiopia
+- **Americas** - Limited entries about North American settlements and pre-Columbian cultures
+
+### **Major Historical Themes Covered:**
+
+1. **Political Changes**: Royal successions, coronations, battles, sieges, invasions
+2. **Religious Events**: Papal elections, Church schisms (Great Schism of 1054), crusades (First Crusade 1095-1099), monastery foundations
+3. **Military Conflicts**: Norman conquests (England 1066), Byzantine conflicts, crusades, Almoravid invasions
+4. **Cultural & Scientific Achievements**: Construction of cathedrals, invention of movable type printing, astronomical observations
+5. **Technology**: Paper money in China, printing technologies, mechanical innovations
+
+### **Notable Events Highlighted:**
+- **1066**: Norman Conquest of England
+- **1054**: East-West Schism in Christianity
+- **1095-1099**: First Crusade
+- **1001-1087**: Various Viking, Byzantine, and Islamic dynastic conflicts
+
+This historical database appears to be sourced from Wikipedia's "Years in history" pages and provides a rich chronological record of medieval world history.

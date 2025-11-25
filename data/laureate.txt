@@ -1,0 +1,29 @@
+## Summary of **data/laureate.json**
+
+This file contains comprehensive data about Nobel Prize laureates from 1901 to 2025. Here's what the data includes:
+
+### **Data Structure:**
+- **Total Records**: 1,060+ laureate entries
+- **Key Fields per Entry**:
+  - Personal info: ID, firstname, surname, birth/death dates and locations
+  - Biographical data: birthCountry, birthCountryCode, bornCity, diedCountry, gender
+  - Prize information: year awarded, category (physics, chemistry, medicine, peace, literature, economics), share percentage, motivation/citation
+  - Affiliations: institution name, city, country where work was performed
+
+### **Prize Categories:**
+1. **Physics** (annual, started 1901)
+2. **Chemistry** (annual, started 1901)
+3. **Medicine/Physiology** (annual, started 1901)
+4. **Literature** (annual, started 1901)
+5. **Peace** (annual, started 1901)
+6. **Economics** (started 1969, added as official category)
+
+### **Notable Features:**
+- **Multiple Laureates**: Some individuals have won prizes in different years/categories (e.g., Marie Curie won Physics 1903 and Chemistry 1911)
+- **Organizational Awards**: Organizations are included (Red Cross, UN agencies, campaigns)
+- **Gender Distribution**: Includes female Nobel laureates (historically underrepresented before recent decades)
+- **Geographic Coverage**: Laureates from over 100 countries worldwide
+- **Time Range**: Early pioneers (1901) through very recent awards (2025)
+- **Motivation Field**: Detailed citations explaining why each laureate received the prize
+
+This is a rich dataset for analyzing Nobel Prize trends, gender representation, geographic distribution, and the evolution of scientific and peace accomplishments over 125+ years.

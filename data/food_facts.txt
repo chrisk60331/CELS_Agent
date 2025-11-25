@@ -1,0 +1,44 @@
+## Summary of food_facts.json
+
+This JSON file contains detailed product information for **Popchips Barbeque Potato Chips** (product code: 5060292302201). Here are the key highlights:
+
+### **Product Basics**
+- **Brand**: Popchips
+- **Product Name**: Barbeque Potato Chips
+- **Serving Size**: 23g
+- **Countries**: France, United Kingdom
+
+### **Nutritional Information** (per 100g)
+- Energy: 1,820 kJ (435 kcal)
+- Carbohydrates: 69.6g
+- Fat: 13.9g (Saturated: 1.3g)
+- Protein: 6.52g
+- Fiber: 4.78g
+- Salt: 0.859g
+- Sugars: 8.26g
+
+### **Health Ratings**
+- **Nutriscore**: C grade (2023), B grade (2021)
+- **Ecoscore**: B grade
+- **NOVA Group**: 4 (ultra-processed food)
+
+### **Key Ingredients** (main components)
+- Dried Potato (54%)
+- Rice Flour (20.8%)
+- Sunflower Oil (10.4%)
+- Barbeque Flavour (seasoning blend)
+- Potato Starch
+
+### **Allergens & Labels**
+- **Allergen**: Milk
+- **Labels**: Vegetarian, No preservatives, No artificial anything
+- **Vegan-friendly**: Mostly yes, but barbeque flavour status unknown
+
+### **Data Quality**
+- Completeness: 90% (0.9)
+- Multiple contributors have edited this product
+- Last updated: November 10, 2025
+
+### **Environmental Impact**
+- Carbon footprint: 1.54 kg CO2 per product (primarily from agriculture and packaging)
+- Packaging: 2x plastic packets (mixed plastic film)
