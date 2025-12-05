@@ -17,6 +17,7 @@ from wordfreq import zipf_frequency
 import spacy  # type: ignore[import-error]
 from spacy.language import Language  # type: ignore[import-error]
 
+from src.compressed_agent.bedrock_client import BedrockClient
 
 MAX_SUMMARY_CHARS = 1500
 MAX_FACT_LINES = 14
@@ -65,10 +66,13 @@ def summarize_data_file(file_path: Path, raw_text: str) -> str:
     augmented_facts = fact_sentences + noun_phrase_facts
     key_phrase_set = set(key_phrases) | {term.lower() for term in noun_phrase_terms}
     salient_candidates = _select_salient_facts(augmented_facts, key_phrase_set)
-    salient_facts = identity_facts + [
+    anchor_facts = _select_topic_anchor_facts(fact_sentences, identity_facts)
+    salient_facts = identity_facts + anchor_facts + [
         fact
         for fact in salient_candidates
-        if fact not in identity_facts and not fact.startswith("noun_phrase.")
+        if fact not in identity_facts
+        and not fact.startswith("noun_phrase.")
+        and not _is_metadata_label(fact.split(":", 1)[0])
     ]
     salient_facts = [fact for fact in salient_facts if not _is_media_path(fact)]
 
@@ -254,6 +258,8 @@ def _rank_by_generic_salience(facts: List[str], keywords: set[str]) -> List[str]
         avg_frequency = sum(frequency[token] for token in tokens) / len(tokens)
         rarity = min(_token_zipf(token) for token in tokens if token) if tokens else 10.0
         label, value = _split_fact(fact)
+        if _is_metadata_label(label):
+            continue
         depth = label.count(".")
         numeric_value = any(ch.isdigit() for ch in value)
         semantic_priority = _semantic_priority(label, value, label_token_counts, label_token_quality)
@@ -336,6 +342,7 @@ def _path_to_label(path: tuple[str, ...]) -> str:
 _TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+")
 _URL_PATTERN = re.compile(r"https?://", re.IGNORECASE)
 _TAG_VALUE_PATTERN = re.compile(r"^[a-z]{2,3}:[^\s]+$", re.IGNORECASE)
+_METADATA_SUFFIXES = ("_code", "_codes", "_tag", "_tags", "_debug")
 
 
 def _tokenize(text: str) -> List[str]:
@@ -392,17 +399,44 @@ def _semantic_priority(
         -0.5 if (any(ch.isalpha() for ch in value) and any(ch.isdigit() for ch in value)) else 0.0
     )
     quality_bonus = max(0.0, avg_token_quality / 2.0)
+    code_penalty = 0.7 if "_code" in label_lower else 0.0
+    tag_penalty = 0.5 if ".tags" in label_lower or label_lower.endswith("_tags") else 0.0
+    preference_offset = _label_preference_offset(label_lower)
 
     score = (
         rarity
         + frequency_penalty
         + depth_penalty
         + list_penalty
+        + code_penalty
+        + tag_penalty
         + digit_bonus
         + mixed_value_bonus
         - quality_bonus
+        + preference_offset
     )
     return max(0.0, score)
+
+
+def _label_preference_offset(label_lower: str) -> float:
+    offset = 0.0
+    if "name" in label_lower or "title" in label_lower:
+        offset -= 1.2
+    if "brand" in label_lower:
+        offset -= 0.8
+    if "country" in label_lower or "countries" in label_lower:
+        offset -= 0.6
+    if "serving" in label_lower or "quantity" in label_lower:
+        offset -= 0.5
+    if "ingredient" in label_lower:
+        offset -= 0.7
+    if "allergen" in label_lower or ".labels" in label_lower:
+        offset -= 0.5
+    if "score" in label_lower or "grade" in label_lower:
+        offset -= 0.4
+    if "packaging" in label_lower:
+        offset -= 0.4
+    return offset
 
 
 def _value_quality(value: str) -> float:
@@ -427,7 +461,7 @@ def _value_quality(value: str) -> float:
 
 def _is_informative_keyword(keyword: str) -> bool:
     candidate = keyword.strip().lower()
-    if len(candidate) < 3 or candidate.isdigit():
+    if len(candidate) < 4 or candidate.isdigit():
         return False
     if _token_zipf(candidate) >= 6.5:
         return False
@@ -442,10 +476,18 @@ def _looks_like_taxonomy_tag(value: str) -> bool:
     return bool(_TAG_VALUE_PATTERN.match(value.strip()))
 
 
+def _is_metadata_label(label: str) -> bool:
+    for segment in label.lower().split("."):
+        base = segment.split("[", 1)[0]
+        if any(base.endswith(suffix) for suffix in _METADATA_SUFFIXES):
+            return True
+    return False
+
+
 def _is_media_path(fact: str) -> bool:
     label = fact.split(":", 1)[0].lower()
-    media_tokens = ("image", "thumb", "upload", "size")
-    return any(token in label for token in media_tokens)
+    media_tokens = ("image", "thumb", "upload")
+    return any(token in label for token in media_tokens) or ".size" in label
 
 
 def _prioritize_keys(keys: Iterable[str]) -> List[str]:
@@ -639,6 +681,8 @@ def _select_headline_facts(facts: List[str], limit: int = 6) -> List[str]:
 
     for fact in facts:
         label, value = _split_fact(fact)
+        if _is_metadata_label(label):
+            continue
         text = value.strip()
         if not text or len(text) < 4 or len(text) > 160:
             continue
@@ -687,6 +731,64 @@ def _select_headline_facts(facts: List[str], limit: int = 6) -> List[str]:
         if len(results) >= limit:
             break
     return results
+
+
+def _select_topic_anchor_facts(facts: List[str], existing: List[str], max_topics: int = 4) -> List[str]:
+    if not facts:
+        return []
+
+    label_token_counts, label_token_quality = _label_token_stats(facts)
+    existing_set = set(existing)
+    token_candidates: List[tuple[tuple[float, float, float, str], str]] = []
+
+    for token, count in label_token_counts.items():
+        if not token or count == 0:
+            continue
+        rarity = _token_zipf(token)
+        quality = label_token_quality.get(token, 0.0) / max(1, count)
+        token_candidates.append(((rarity, count, -quality, token), token))
+
+    token_candidates.sort()
+    anchors: List[str] = []
+
+    for _, token in token_candidates:
+        fact_candidates: List[tuple[tuple, str]] = []
+        for fact in facts:
+            if fact in existing_set:
+                continue
+            label, value = _split_fact(fact)
+            if _is_metadata_label(label):
+                continue
+            tokens = set(_tokenize(label.lower().replace("_", " ")))
+            if token not in tokens:
+                continue
+            value_quality = _value_quality(value)
+            if value_quality <= 0:
+                continue
+            semantic_priority = _semantic_priority(
+                label, value, label_token_counts, label_token_quality
+            )
+            fact_candidates.append(
+                (
+                    (
+                        -value_quality,
+                        semantic_priority,
+                        len(tokens),
+                        len(label),
+                    ),
+                    fact,
+                )
+            )
+        if not fact_candidates:
+            continue
+        fact_candidates.sort()
+        best_fact = fact_candidates[0][1]
+        anchors.append(best_fact)
+        existing_set.add(best_fact)
+        if len(anchors) >= max_topics:
+            break
+
+    return anchors
 
 
 def _limit_redundancy(facts: List[str], limit: int) -> List[str]:

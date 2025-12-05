@@ -6,7 +6,7 @@ from strands import Agent
 from strands.agent.agent_result import AgentResult
 from strands_tools import editor, file_read, file_write
 
-from benchmarks.agent_run_summary import AgentRunSummary
+from src.agent_run_summary import AgentRunSummary
 from constants import MODEL_ID, task
 
 # Define a focused system prompt for file operations

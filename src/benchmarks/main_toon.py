@@ -5,7 +5,7 @@ from typing import Any, Sequence
 from strands import Agent
 from strands.agent.agent_result import AgentResult
 
-from benchmarks.agent_run_summary import AgentRunSummary
+from src.agent_run_summary import AgentRunSummary
 from benchmarks.toon_tools import file_read
 from constants import MODEL_ID, task
 

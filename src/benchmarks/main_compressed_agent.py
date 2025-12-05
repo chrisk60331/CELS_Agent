@@ -1,11 +1,15 @@
 """Benchmark runner for CompressedAgent."""
 from __future__ import annotations
+import logging
 
 from src.compressed_agent.agent import CompressedAgent
 from src.compressed_agent.bedrock_client import BedrockClient
-from benchmarks.agent_run_summary import AgentRunSummary
+from src.agent_run_summary import AgentRunSummary
 from constants import MODEL_ID
-import constants
+
+
+from src.constants import task
+logging.basicConfig(level=logging.INFO)
 
 
 def run_compressed_agent(task_override: str | None = None) -> AgentRunSummary:
@@ -13,9 +17,7 @@ def run_compressed_agent(task_override: str | None = None) -> AgentRunSummary:
     bedrock_client = BedrockClient(model_id=MODEL_ID)
     agent = CompressedAgent(bedrock_client=bedrock_client)
 
-    goal = (task_override or constants.task or "").strip()
-    if not goal:
-        raise ValueError("Benchmark task is empty; populate constants.task.")
+    goal = task_override or task
 
     result = agent.execute_goal(goal, max_steps=10)
 
@@ -66,9 +68,6 @@ def _extract_final_answer(result: dict) -> str:
         return "\n\n".join(summaries)
     if previews:
         return "\n".join(previews)
-
-    if "pick" in goal_lower and "number" in goal_lower:
-        return "I pick the number 42."
     
     # Try to get a summary from the final state
     final_state = result.get("final_state", {})
@@ -97,7 +96,7 @@ def _extract_final_answer(result: dict) -> str:
     
     if not parts:
         return f"Completed goal: {result.get('goal', 'unknown')}"
-    
+
     return ". ".join(parts) + "."
 
 

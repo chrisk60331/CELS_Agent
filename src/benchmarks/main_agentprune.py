@@ -8,7 +8,7 @@ from typing import Dict, Sequence
 from strands import Agent
 from strands_tools import editor, file_read, file_write
 
-from benchmarks.agent_run_summary import AgentRunSummary
+from src.agent_run_summary import AgentRunSummary
 from benchmarks.main import FILE_SYSTEM_PROMPT, _extract_response_text
 from constants import MODEL_ID, task
 

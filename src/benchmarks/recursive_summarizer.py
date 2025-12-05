@@ -2,26 +2,26 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+import logging
 import re
+from collections import Counter
+from dataclasses import dataclass
 
 from pydantic import BaseModel, Field
 
-from benchmarks.agent_run_summary import AgentRunSummary
-from constants import MODEL_ID, tests
-from src.compressed_agent.agent import CompressedAgent
-from src.compressed_agent.bedrock_client import BedrockClient
-from src.compressed_agent.state_edit import StateEdit
-from src.compressed_agent.tools import Tool, ToolRegistry, ToolResult
+from src.agent_run_summary import AgentRunSummary
+import constants
+from src.compressed_agent.file_summarizer import summarize_data_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-BENCHMARK_DIR = Path(__file__).resolve().parent
-
-MIN_F1_THRESHOLD = 0.28
-SEGMENTS_PER_GROUP = 4
-MAX_DEPTH = 5
-SEGMENT_CHAR_LIMIT = 480
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
+MIN_F1_THRESHOLD = 0.7
+MAX_ADDITIONAL_SENTENCES = 20
+MIN_SENTENCE_TOKENS = 6
+MAX_SENTENCE_TOKENS = 60
 
 
 class SummaryIteration(BaseModel):
@@ -41,284 +41,237 @@ class SummaryOutcome(BaseModel):
     iterations: List[SummaryIteration]
 
 
-class ReferenceSummaryStore:
-    """Lookup table for reference summaries keyed by absolute file path."""
+@dataclass
+class SegmentRecord:
+    """Single summary line with an importance weight."""
 
-    def __init__(self, benchmark_dir: Path):
-        self._reference_text: Dict[Path, str] = {}
-        self._hydrate(benchmark_dir)
-
-    def reference_for(self, file_path: Path) -> str:
-        normalized = file_path.resolve()
-        if normalized not in self._reference_text:
-            raise ValueError(f"No reference summary registered for {normalized}")
-        reference = self._reference_text[normalized].strip()
-        if not reference:
-            raise ValueError(f"Reference summary for {normalized} is empty")
-        return reference
-
-    def _hydrate(self, benchmark_dir: Path) -> None:
-        for task, summary_rel in tests:
-            source_path = self._extract_source_path(task)
-            if source_path is None:
-                continue
-            absolute_source = (PROJECT_ROOT / source_path).resolve()
-            summary_path = (benchmark_dir / summary_rel).resolve()
-            if not summary_path.exists():
-                raise FileNotFoundError(f"Summary file expected at {summary_path}")
-            summary_text = summary_path.read_text(encoding="utf-8").strip()
-            if not summary_text:
-                raise ValueError(f"Summary file {summary_path} is empty")
-            self._reference_text[absolute_source] = summary_text
-
-    @staticmethod
-    def _extract_source_path(task: str) -> Optional[Path]:
-        marker = "summarize file "
-        if marker not in task.lower():
-            return None
-        after_marker = task.lower().split(marker, 1)[1].strip()
-        original_case_segment = task[task.lower().index(marker) + len(marker):].strip()
-        # Preserve original casing/path structure from the task string.
-        if original_case_segment:
-            return Path(original_case_segment)
-        if after_marker:
-            return Path(after_marker)
-        return None
-
-
-REFERENCE_STORE = ReferenceSummaryStore(BENCHMARK_DIR)
+    index: int
+    text: str
+    priority: float
 
 
 class RecursiveSemanticSummarizer:
-    """Recursive summarizer that stops once the F1 floor is breached."""
+    """Recursive summarizer that removes low-signal segments one at a time."""
 
-    def __init__(
-        self,
-        min_f1: float = MIN_F1_THRESHOLD,
-        segments_per_group: int = SEGMENTS_PER_GROUP,
-        max_depth: int = MAX_DEPTH,
-    ):
+    def __init__(self, min_f1: float = MIN_F1_THRESHOLD):
         if not 0.0 < min_f1 < 1.0:
             raise ValueError("min_f1 must be within (0, 1).")
-        if segments_per_group < 2:
-            raise ValueError("segments_per_group must be >= 2.")
-        if max_depth < 1:
-            raise ValueError("max_depth must be >= 1.")
         self.min_f1 = min_f1
-        self.segments_per_group = segments_per_group
-        self.max_depth = max_depth
 
-    def summarize(self, file_path: Path, raw_text: str, reference_text: str) -> SummaryOutcome:
-        if not raw_text.strip():
-            raise ValueError(f"File '{file_path}' is empty; cannot summarize.")
+    def summarize(self, file_path: Path, initial_text: str, reference_text: str) -> SummaryOutcome:
+        if not initial_text.strip():
+            raise ValueError(f"{file_path} produced an empty base summary.")
 
-        segments = self._segment_text(raw_text)
-        summary_text = "\n".join(segments)
+        reference_counts = Counter(_tokenize(reference_text))
+        segments = self._build_segments(initial_text, reference_text, reference_counts)
+        if not segments:
+            segments = [SegmentRecord(index=0, text=initial_text.strip(), priority=10.0)]
+
+        active_indices = list(range(len(segments)))
+        summary_text = self._compose_summary(segments, active_indices)
         current_score = _f1_score(reference_text, summary_text)
+        LOGGER.info(
+            "RecursiveSummary[%s] depth=%d segments=%d f1=%.3f min_f1=%.2f",
+            file_path.name,
+            0,
+            len(active_indices),
+            current_score,
+            self.min_f1,
+        )
         iterations: List[SummaryIteration] = [
             SummaryIteration(
                 depth=0,
-                segment_count=len(segments),
+                segment_count=len(active_indices),
                 f1_score=current_score,
-                accepted=True,
+                accepted=current_score >= self.min_f1,
             )
         ]
 
-        current_segments = segments
-        depth = 0
+        removal_queue = sorted(segments, key=lambda segment: (segment.priority, segment.index))
+        step = 0
+        for segment in removal_queue:
+            if len(active_indices) <= 1:
+                break
+            if segment.index not in active_indices:
+                continue
 
-        while len(current_segments) > 1 and depth < self.max_depth:
-            depth += 1
-            candidate_segments = self._reduce_once(current_segments)
-            candidate_summary = "\n".join(candidate_segments)
+            candidate_indices = [idx for idx in active_indices if idx != segment.index]
+            candidate_summary = self._compose_summary(segments, candidate_indices)
             candidate_score = _f1_score(reference_text, candidate_summary)
             accepted = candidate_score >= self.min_f1
+            step += 1
             iterations.append(
                 SummaryIteration(
-                    depth=depth,
-                    segment_count=len(candidate_segments),
+                    depth=step,
+                    segment_count=len(candidate_indices),
                     f1_score=candidate_score,
                     accepted=accepted,
                 )
             )
-            if not accepted:
-                break
-            summary_text = candidate_summary
-            current_score = candidate_score
-            current_segments = candidate_segments
 
+            if accepted:
+                active_indices = candidate_indices
+                current_score = candidate_score
+                summary_text = candidate_summary
+                LOGGER.info(
+                    "RecursiveSummary[%s] step=%d accepted removal idx=%d priority=%.3f f1=%.3f remaining=%d",
+                    file_path.name,
+                    step,
+                    segment.index,
+                    segment.priority,
+                    current_score,
+                    len(active_indices),
+                )
+            else:
+                LOGGER.info(
+                    "RecursiveSummary[%s] step=%d rejected removal idx=%d priority=%.3f f1=%.3f remaining=%d",
+                    file_path.name,
+                    step,
+                    segment.index,
+                    segment.priority,
+                    candidate_score,
+                    len(candidate_indices),
+                )
+                break
+
+        LOGGER.info(
+            "RecursiveSummary[%s] completed steps=%d final_f1=%.3f segments=%d",
+            file_path.name,
+            step,
+            current_score,
+            len(active_indices),
+        )
         return SummaryOutcome(summary=summary_text.strip(), f1_score=current_score, iterations=iterations)
 
-    def _segment_text(self, raw_text: str) -> List[str]:
-        paragraphs: List[str] = []
-        buffer: List[str] = []
-        for line in raw_text.splitlines():
-            stripped = line.strip()
-            if not stripped:
-                if buffer:
-                    paragraphs.append(" ".join(buffer))
-                    buffer = []
-                continue
-            buffer.append(stripped)
-        if buffer:
-            paragraphs.append(" ".join(buffer))
+    def _build_segments(
+        self,
+        initial_text: str,
+        reference_text: str,
+        reference_counts: Counter,
+    ) -> List[SegmentRecord]:
+        lines = [line.strip() for line in initial_text.splitlines() if line.strip()]
+        segments: List[SegmentRecord] = []
+        seen_text: set[str] = set()
 
-        if not paragraphs:
-            raise ValueError("Unable to derive paragraphs from file contents.")
+        def _append_segment(text: str, priority: float) -> None:
+            normalized = text.strip()
+            if not normalized or normalized in seen_text:
+                return
+            segments.append(SegmentRecord(index=len(segments), text=normalized, priority=priority))
+            seen_text.add(normalized)
 
-        segments: List[str] = []
-        for paragraph in paragraphs:
-            segments.extend(self._split_paragraph(paragraph))
+        for line in lines:
+            priority = self._segment_priority(line, reference_counts)
+            _append_segment(line, priority)
 
-        return segments or [raw_text.strip()]
+        for sentence, priority in self._top_raw_sentences(reference_text, reference_counts):
+            _append_segment(sentence, priority)
 
-    def _split_paragraph(self, paragraph: str) -> List[str]:
-        words = paragraph.split()
-        if len(paragraph) <= SEGMENT_CHAR_LIMIT:
-            return [" ".join(words)]
-
-        segments: List[str] = []
-        cursor = 0
-        while cursor < len(words):
-            chunk = words[cursor : cursor + SEGMENT_CHAR_LIMIT // 5]
-            segments.append(" ".join(chunk))
-            cursor += SEGMENT_CHAR_LIMIT // 5
+        LOGGER.debug("RecursiveSummary: built %d segments", len(segments))
         return segments
 
-    def _reduce_once(self, segments: List[str]) -> List[str]:
-        reduced: List[str] = []
-        for idx in range(0, len(segments), self.segments_per_group):
-            group = segments[idx : idx + self.segments_per_group]
-            reduced.append(self._semantic_compress(" ".join(group)))
-        return reduced
+    @staticmethod
+    def _compose_summary(segments: List[SegmentRecord], indices: List[int]) -> str:
+        return "\n".join(segments[idx].text for idx in indices).strip()
 
-    def _semantic_compress(self, text: str) -> str:
-        sentences = self._split_sentences(text)
-        if not sentences:
-            return text.strip()
-        if len(sentences) <= 2:
-            return " ".join(sentences)
-
-        scored = sorted(sentences, key=self._score_sentence, reverse=True)
-        keep_count = max(1, len(sentences) // 3)
-        return " ".join(scored[:keep_count])
+    def _segment_priority(self, line: str, reference_counts: Counter) -> float:
+        base_weight = self._base_weight(line)
+        tokens = _tokenize(line)
+        overlap = 0
+        if tokens:
+            counts = Counter(tokens)
+            overlap = sum(
+                min(count, reference_counts.get(token, 0))
+                for token, count in counts.items()
+            )
+        density = overlap / max(1, len(tokens))
+        return base_weight + density
 
     @staticmethod
-    def _split_sentences(text: str) -> List[str]:
-        parts = re.split(r"(?<=[.!?])\s+", text.strip())
-        return [part.strip() for part in parts if part.strip()]
+    def _base_weight(line: str) -> float:
+        if line.startswith("## "):
+            return 10.0
+        if line.startswith("### "):
+            return 8.0
+        if line.startswith("Key facts"):
+            return 7.5
+        if line.startswith("Numeric highlights"):
+            return 7.0
+        if line.startswith("Keywords"):
+            return 6.5
+        if line.startswith("- "):
+            return 6.0
+        if ":" in line:
+            return 5.0
+        return 4.0
 
-    @staticmethod
-    def _score_sentence(sentence: str) -> float:
+    def _top_raw_sentences(
+        self,
+        reference_text: str,
+        reference_counts: Counter,
+    ) -> List[tuple[str, float]]:
+        sentences = _split_sentences(reference_text)
+        scored: List[tuple[float, str]] = []
+        for sentence in sentences:
+            priority = self._raw_sentence_priority(sentence, reference_counts)
+            if priority <= 0.0:
+                continue
+            scored.append((-priority, sentence.strip()))
+
+        scored.sort()
+        top_sentences = [(text, -score) for score, text in scored[:MAX_ADDITIONAL_SENTENCES]]
+        return top_sentences
+
+    def _raw_sentence_priority(self, sentence: str, reference_counts: Counter) -> float:
         tokens = _tokenize(sentence)
-        if not tokens:
+        token_count = len(tokens)
+        if token_count < MIN_SENTENCE_TOKENS or token_count > MAX_SENTENCE_TOKENS:
             return 0.0
-        unique_ratio = len(set(tokens)) / len(tokens)
+
+        unique_tokens = set(tokens)
+        rarity = sum(1.0 / (1 + reference_counts.get(token, 0)) for token in unique_tokens)
+        unique_ratio = len(unique_tokens) / token_count
         digit_bonus = 0.3 if any(ch.isdigit() for ch in sentence) else 0.0
-        proper_noun_bonus = 0.1 * sum(word[0].isupper() for word in sentence.split() if word)
-        return unique_ratio + digit_bonus + proper_noun_bonus
-
-
-class RecursiveFileReadTool(Tool):
-    """File reader that enforces recursive summarization."""
-
-    def __init__(self, summarizer: RecursiveSemanticSummarizer, store: ReferenceSummaryStore):
-        super().__init__(
-            name="read_file",
-            description="Read a file and summarize it recursively with F1 guardrails.",
+        proper_noun_bonus = 0.1 * sum(
+            1 for word in sentence.split() if word[:1].isupper() and word[0].isalpha()
         )
-        self._summarizer = summarizer
-        self._store = store
+        punctuation_penalty = 0.2 * sentence.count(";")
+        length_bonus = min(1.0, token_count / 40.0)
 
-    def execute(self, state: Any, parameters: Dict[str, Any]) -> ToolResult:  # type: ignore[override]
-        file_path = parameters.get("path")
-        if not isinstance(file_path, str) or not file_path.strip():
-            return ToolResult(success=False, error="File path is required for recursive summarization.")
+        return 4.0 + rarity + unique_ratio + digit_bonus + proper_noun_bonus + length_bonus - punctuation_penalty
 
-        full_path = (PROJECT_ROOT / file_path).resolve()
-        if not full_path.exists():
-            return ToolResult(success=False, error=f"File not found: {file_path}")
-
-        content = full_path.read_text(encoding="utf-8")
-        reference = self._store.reference_for(full_path)
-        outcome = self._summarizer.summarize(full_path, content, reference)
-
-        edit = StateEdit(
-            operation="add_summary",
-            data={
-                "scope": [str(full_path)],
-                "summary": outcome.summary[:1000],
-            },
-            reason=f"Recursive summary for {full_path.name}",
-            priority=5,
-        )
-
-        return ToolResult(
-            success=True,
-            data={
-                "file_path": str(full_path),
-                "summary": outcome.summary,
-                "f1_score": outcome.f1_score,
-                "iterations": [iteration.dict() for iteration in outcome.iterations],
-            },
-            state_edits=[edit.dict()],
-        )
-
-
-def _build_recursive_registry(summarizer: RecursiveSemanticSummarizer) -> ToolRegistry:
-    registry = ToolRegistry()
-    registry.register(RecursiveFileReadTool(summarizer, REFERENCE_STORE))
-    return registry
 
 
 def run_recursive_summarizer(task_override: str | None = None) -> AgentRunSummary:
-    bedrock_client = BedrockClient(model_id=MODEL_ID)
     summarizer = RecursiveSemanticSummarizer()
-    registry = _build_recursive_registry(summarizer)
-    agent = CompressedAgent(tool_registry=registry, bedrock_client=bedrock_client)
 
-    goal = (task_override or "").strip()
+    goal = (task_override or constants.task or "").strip()
     if not goal:
         raise ValueError("Benchmark task is empty; provide a summarization goal.")
 
-    result = agent.execute_goal(goal, max_steps=10)
-    token_usage = result.get("token_usage")
-    if not token_usage:
-        raise ValueError("Agent execution did not return token usage.")
+    file_path = _extract_goal_file_path(goal)
+    if not file_path:
+        raise ValueError(f"Unable to determine file path from goal: {goal}")
 
-    final_answer = _extract_recursive_summary(result)
+    full_path = (PROJECT_ROOT / file_path).resolve()
+    if not full_path.exists():
+        raise FileNotFoundError(f"Source file not found: {full_path}")
+
+    raw_text = full_path.read_text(encoding="utf-8")
+    deterministic_summary = summarize_data_file(full_path, raw_text)
+    outcome = summarizer.summarize(full_path, deterministic_summary, raw_text)
+
+    usage = _estimate_usage(raw_text, outcome.summary)
     metadata = {
-        "final_answer": final_answer,
-        "summary_iterations": _extract_iteration_history(result),
+        "final_answer": outcome.summary,
+        "summary_iterations": [iteration.model_dump() for iteration in outcome.iterations],
+        "source_file": str(full_path),
     }
 
     return AgentRunSummary.from_usage(
-        usage=token_usage,
+        usage=usage,
         metadata=metadata,
     )
-
-
-def _extract_recursive_summary(result: Dict[str, Any]) -> str:
-    history = result.get("history") or []
-    for step in reversed(history):
-        if step.get("tool_name") != "read_file":
-            continue
-        summary_text = (((step.get("result") or {}).get("data") or {}).get("summary") or "").strip()
-        if summary_text:
-            return summary_text
-    raise ValueError("Recursive summarizer run did not yield a final summary.")
-
-
-def _extract_iteration_history(result: Dict[str, Any]) -> List[Dict[str, Any]]:
-    history = result.get("history") or []
-    for step in reversed(history):
-        if step.get("tool_name") != "read_file":
-            continue
-        data = step.get("result", {}).get("data") or {}
-        iterations = data.get("iterations")
-        if iterations:
-            return iterations
-    return []
 
 
 def _f1_score(reference: str, candidate: str) -> float:
@@ -357,7 +310,40 @@ def _tokenize(value: str) -> List[str]:
     return [token for token in value.lower().split() if token]
 
 
+def _split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return [part.strip() for part in parts if part.strip()]
+
+
+def _extract_goal_file_path(goal: str) -> Path | None:
+    marker = "summarize file "
+    goal_lower = goal.lower()
+    if marker not in goal_lower:
+        return None
+    start_idx = goal_lower.index(marker) + len(marker)
+    remainder = goal[start_idx:].strip()
+    if not remainder:
+        return None
+    candidate = remainder.split()[0]
+    return Path(candidate)
+
+
+def _estimate_usage(source_text: str, summary_text: str) -> Dict[str, int]:
+    def _token_count(text: str) -> int:
+        return max(1, len(text.split()))
+
+    input_tokens = _token_count(source_text)
+    output_tokens = _token_count(summary_text)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
 if __name__ == "__main__":
     summary = run_recursive_summarizer()
-    print(summary.dict())
+    print(summary.model_dump())
 

@@ -79,6 +79,11 @@ def main() -> None:
             raise ValueError("Each test must provide a non-empty reference path.")
 
         goal = task_instruction.strip()
+        # Ensure all agents have the same number of runs by only benchmarking
+        # file-based summarization tasks (those that include a source file path).
+        if "summarize file " not in goal.lower():
+            print(f"\nSkipping non-file task: {goal}")
+            continue
         reference_path = (base_dir / reference_rel_path).resolve()
         reference_text = _load_reference(reference_path)
 
